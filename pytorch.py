@@ -10,11 +10,19 @@ class DNN(nn.Module):
         super().__init__()
         self.flatten = nn.Flatten()
         self.layer_stack = nn.Sequential(
-            nn.Linear(256 * 256, 5120),
+            nn.Linear(256 * 256, 300),
             nn.ReLU(),
-            nn.Linear(5120, 5120),
+            nn.Linear(300, 300),
             nn.ReLU(),
-            nn.Linear(5120, 5120),
+            nn.Linear(300, 300),
+            nn.ReLU(),
+            nn.Linear(300, 300),
+            nn.ReLU(),
+            nn.Linear(300, 300),
+            nn.ReLU(),
+            nn.Linear(300, 300),
+            nn.ReLU(),
+            nn.Linear(300, 300),
             nn.ReLU(),
         )
     
@@ -50,10 +58,10 @@ if __name__ == '__main__':
 
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    epochs = 50
+    epochs = 300
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.003)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     for epoch in range(epochs):
         model.train()
