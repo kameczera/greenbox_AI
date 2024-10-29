@@ -5,18 +5,36 @@ import numpy as np
 
 kernel_code = """
 extern "C" __global__ void matrix_mul(float *w, float *a, float *b, float *z, int w_rows, int w_cols, int a_cols) {
+    __shared__ float tile_w[32][32];
+    __shared__ float tile_a[32][32];
+
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     
+    float value = 0.0;
+    for (int i = 0; i < (w_cols + 32 - 1) / 32; i++) {
+        if (row < w_rows && (i * 32 + threadIdx.x) < w_cols) 
+            tile_w[threadIdx.y][threadIdx.x] = w[row * w_cols + i * 32 + threadIdx.x];
+        else
+            tile_w[threadIdx.y][threadIdx.x] = 0.0;
+
+        if (col < a_cols && (i * 32 + threadIdx.y) < w_cols)
+            tile_a[threadIdx.y][threadIdx.x] = a[(i * 32 + threadIdx.y) * a_cols + col];
+        else
+            tile_a[threadIdx.y][threadIdx.x] = 0.0;
+
+        __syncthreads();
+        
+        for (int j = 0; j < 32; j++) 
+            value += tile_w[threadIdx.y][j] * tile_a[j][threadIdx.x];
+        
+        __syncthreads();
+    }
+
     if (row < w_rows && col < a_cols) {
-        float value = 0.0;
-        for (int i = 0; i < w_cols; i++) {
-            value += w[row * w_cols + i] * a[i * a_cols + col]; 
-        }
         z[row * a_cols + col] = value + b[row];
     }
 }
-
 extern "C" __global__ void tanh_calc(float *z, float *a, int n_rows, int n_cols) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,10 +56,20 @@ extern "C" __global__ void sigmoid_calc(float *z, float *a, int n_rows, int n_co
 }
 
 extern "C" __global__ void relu_calc(float *z, float *a, int n_rows, int n_cols) {
+    __shared__ float shared_data[32][32];
+
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (row < n_rows && col < n_cols) {
-        a[row * n_cols + col] = fmaxf(0.0, z[row * n_cols + col]);  // ReLU: max(0, input[idx])
+        shared_data[threadIdx.y][threadIdx.x] = z[row * n_cols + col];
+    }
+    __syncthreads();
+
+    // Aplicar a função ReLU
+    if (row < n_rows && col < n_cols) {
+        a[row * n_cols + col] = shared_data[threadIdx.y][threadIdx.x] > 0.0f ? 
+                                 shared_data[threadIdx.y][threadIdx.x] : 0.0f;
     }
 }
 
@@ -89,23 +117,23 @@ extern "C" __global__ void compute_db(float *dZ, float *result, int rows, int co
     }
 }
 
-extern "C" __global__ void compute_dZ(float *W, float *dZ_next, float *A, float *dZ, int w_rows, int w_cols, int m) {
+extern "C" __global__ void compute_dZ(float *W, float *dZ_next, float *A, float *dZ, int w_rows, int w_cols, int dZ_rows, int dZ_cols) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (row < w_rows) {
+    if (row < w_cols && col < dZ_cols) {
         float sum = 0.0;
         for (int i = 0; i < w_cols; i++) {
-            sum += W[row * w_cols + i] * dZ_next[i];
+            sum += W[i * w_cols + row] * dZ_next[i * dZ_cols + col];
         }
-
-        // Step 2: Apply the derivative of ReLU
-        dZ[row] = sum * (A[row] > 0 ? 1.0f : 0.0f);
+        int idx = row * dZ_cols + col;
+        dZ[idx] = sum * ((A[idx] > 0) ? 1.0 : 0.0);
     }
 }
 
 extern "C" __global__ void update_weights(float *W, float *dW, float learning_rate, int w_rows, int w_cols) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
     int idx = row * w_cols + col;
 
@@ -128,28 +156,28 @@ dZ_calc_gpu = mod.get_function("compute_dZ")
 update_weights = mod.get_function("update_weights")
 
 def update_weights_gpu(w, dW, learning_rate):
-    block_dim = (16, 16, 1)  # 16x16 threads per block
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(w[1] / block_dim[0])), int(np.ceil(w[2] / block_dim[1])), 1)
 
     update_weights(w[0], dW[0], np.float32(learning_rate), np.int32(w[1]), np.int32(w[2]), block=block_dim, grid=grid_dim)
 
 def compute_dZ_gpu(w, dZ_next, A):
-    dZ = cuda.mem_alloc(w[1] * np.float32().nbytes)
-    block_dim = (256, 1, 1)
-    grid_dim = (int(np.ceil(w[1] / block_dim[0])), 1, 1)
+    dZ = cuda.mem_alloc(A[1] * dZ_next[2] * np.float32().nbytes)
+    block_dim = (32, 32, 1)
+    grid_dim = (int(np.ceil(A[1] / block_dim[0])), int(np.ceil(dZ_next[2] / block_dim[1])), 1)
 
-    dZ_calc_gpu(w[0], dZ_next[0], A[0], dZ, np.int32(w[1]), np.int32(w[2]), block=block_dim, grid=grid_dim)
+    dZ_calc_gpu(w[0], dZ_next[0], A[0], dZ, np.int32(w[1]), np.int32(w[2]), np.int32(dZ_next[1]), np.int32(dZ_next[2]), block=block_dim, grid=grid_dim)
 
-    return (dZ, w[1], 1)
+    return (dZ, A[1], dZ_next[2])
 
 
-def forward_propagation_gpu(w, a, b, w_rows, w_cols, a_cols):
-    z = cuda.mem_alloc(w_rows * a_cols * np.float32().nbytes)
+def forward_propagation_gpu(w, a, b, w_rows, w_cols, a_cols, z = None):
+    if z is None:
+        z = cuda.mem_alloc(w_rows * a_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(a_cols / block_dim[0])), int(np.ceil(w_rows / block_dim[1])), 1)
     matrix_mul_gpu(w, a, b, z, np.int32(w_rows), np.int32(w_cols), np.int32(a_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (z, w_rows, a_cols)
 
@@ -157,68 +185,62 @@ def forward_propagation_gpu(w, a, b, w_rows, w_cols, a_cols):
 def compute_dW(dZ, A, scale):
     dw = cuda.mem_alloc(dZ[1] * A[1] * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(dZ[1] / block_dim[0])), int(np.ceil(A[1] / block_dim[1])), 1)
     compute_dW_gpu(dZ[0], A[0], dw, np.int32(scale), np.int32(dZ[1]), np.int32(dZ[2]), np.int32(A[1]), np.int32(A[2]), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (dw, dZ[1], A[2])
 
 def compute_db(dZ, scale):
     db = cuda.mem_alloc(dZ[2] * np.float32().nbytes)
-
     block_dim = (256, 1, 1)
-    grid_dim = (int(np.ceil(dZ[1] / block_dim[0])), 1, 1)
+    grid_dim = (int(np.ceil(dZ[2] / block_dim[0])), 1, 1)
     
     db_calc_gpu(dZ[0], db, np.int32(dZ[1]), np.int32(dZ[2]), np.float32(scale), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
     return (db, dZ[2], 1)
 
 def subtract_gpu(AL, Y, Y_cols):
     dZ = cuda.mem_alloc(Y_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(Y_cols / block_dim[0])), 1, 1)
     subtract_calc_gpu(AL, Y, dZ, np.int32(Y_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (dZ, 1, Y_cols)
 
 def cost_gpu(Y, AL, AL_cols):
     cost = cuda.mem_alloc(AL_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (1024, 1, 1)
     grid_dim = (int(np.ceil(AL_cols / block_dim[0])), 1, 1)
     cost_calc_gpu(Y, AL, cost, np.int32(AL_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
     return (cost, 1, AL_cols)
 
 def tanh_gpu(z, z_rows, z_cols):
     a = cuda.mem_alloc(z_rows * z_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(z_cols / block_dim[0])), int(np.ceil(z_rows / block_dim[1])), 1)
     tanh_calc_gpu(z, a, np.int32(z_rows), np.int32(z_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (a, z_rows, z_cols)
 
-def relu_gpu(z, z_rows, z_cols):
-    a = cuda.mem_alloc(z_rows * z_cols * np.float32().nbytes)
+def relu_gpu(z, z_rows, z_cols, a = None):
+    if a is None:
+        a = cuda.mem_alloc(z_rows * z_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(z_cols / block_dim[0])), int(np.ceil(z_rows / block_dim[1])), 1)
     relu_calc_gpu(z, a, np.int32(z_rows), np.int32(z_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (a, z_rows, z_cols)
 
-def sigmoid_gpu(z, z_rows, z_cols):
-    a = cuda.mem_alloc(z_rows * z_cols * np.float32().nbytes)
+def sigmoid_gpu(z, z_rows, z_cols, a = None):
+    if a is None:
+        a = cuda.mem_alloc(z_rows * z_cols * np.float32().nbytes)
 
-    block_dim = (16, 16, 1)  # 16 x 16
+    block_dim = (32, 32, 1)
     grid_dim = (int(np.ceil(z_cols / block_dim[0])), int(np.ceil(z_rows / block_dim[1])), 1)
     sigmoid_calc_gpu(z, a, np.int32(z_rows), np.int32(z_cols), block=block_dim, grid=grid_dim)
-    cuda.Context.synchronize()
 
     return (a, z_rows, z_cols)
