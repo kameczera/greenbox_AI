@@ -87,3 +87,7 @@ if __name__ == '__main__':
             correct += (predicted == labels).sum().item()
 
     print(f'Test Accuracy: {100 * correct / total}%')
+    
+    # Salvar o modelo treinado
+    torch.save(model.state_dict(), 'dnn_model.pth')
+    print("Modelo salvo como 'dnn_model.pth'.")
